@@ -171,12 +171,11 @@ function main() {
       const settings = loadClaudeSettings();
       const profile = config.profiles[name];
 
-      // Ensure env object exists
-      if (!settings.env) {
-        settings.env = {};
-      }
+      // Replace env completely - clear old fields to avoid configuration residue
+      // This fixes the issue where old API configurations persist and override new settings
+      settings.env = {};
 
-      // Merge profile into env
+      // Assign all fields from the selected profile
       Object.assign(settings.env, profile);
       config.current = name;
 
