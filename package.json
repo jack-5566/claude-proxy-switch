@@ -1,0 +1,23 @@
+{
+  "name": "claude-proxy-switch",
+  "version": "1.0.0",
+  "description": "Quickly switch between different Claude Code proxy/relay configurations",
+  "main": "bin/claude-proxy-switch.js",
+  "bin": {
+    "claude-proxy": "bin/claude-proxy-switch.js",
+    "claude-proxy-switch": "bin/claude-proxy-switch.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "proxy",
+    "switch",
+    "relay",
+    "china"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^11.1.0"
+  }
+}
