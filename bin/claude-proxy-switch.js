@@ -590,6 +590,135 @@ function main() {
       }
     });
 
+  program
+    .command('clean')
+    .description('Completely clean ALL ANTHROPIC configuration from all locations (start fresh)')
+    .action(() => {
+      console.log('=== Claude Proxy Complete Clean ===\n');
+      console.log('WARNING: This will remove ALL ANTHROPIC configuration from:');
+      console.log('  - settings.json');
+      console.log('  - settings.local.json');
+      console.log('  - shell rc files (.bashrc, .zshrc, etc.)');
+      console.log('  - current session environment variables');
+      console.log('Your saved profiles will be kept.\n');
+
+      let cleanedCount = 0;
+
+      // Clean 1: Clean settings.json - remove all ANTHROPIC
+      const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
+      if (fs.existsSync(SETTINGS_JSON)) {
+        try {
+          const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
+          let removed = 0;
+          if (settingsJson.env) {
+            Object.keys(settingsJson.env).forEach(key => {
+              if (key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY') {
+                delete settingsJson.env[key];
+                removed++;
+              }
+            });
+            if (Object.keys(settingsJson.env).length === 0) {
+              delete settingsJson.env;
+            }
+          }
+          if (removed > 0) {
+            const timestamp = Date.now();
+            const backupFile = `${SETTINGS_JSON}.bak.${timestamp}`;
+            fs.copyFileSync(SETTINGS_JSON, backupFile);
+            fs.writeFileSync(SETTINGS_JSON, JSON.stringify(settingsJson, null, 2), { mode: 0o600 });
+            console.log(`✓ Cleaned settings.json: removed ${removed} ANTHROPIC_* field(s)`);
+            console.log(`  Backup: ${backupFile}`);
+            cleanedCount++;
+          } else {
+            console.log('✓ settings.json already clean');
+          }
+        } catch (e) {
+          console.log(`✗ Failed to clean settings.json: ${e.message}`);
+        }
+      }
+
+      // Clean 2: Clean settings.local.json - empty env completely
+      if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
+        try {
+          const timestamp = Date.now();
+          const backupFile = `${CLAUDE_SETTINGS_FILE}.bak.${timestamp}`;
+          fs.copyFileSync(CLAUDE_SETTINGS_FILE, backupFile);
+          // Write empty env
+          fs.writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify({ env: {} }, null, 2), { mode: 0o600 });
+          console.log(`✓ Cleaned settings.local.json: cleared all environment variables`);
+          console.log(`  Backup: ${backupFile}`);
+          cleanedCount++;
+        } catch (e) {
+          console.log(`✗ Failed to clean settings.local.json: ${e.message}`);
+        }
+      }
+
+      // Clean 3: Remove all ANTHROPIC lines from rc files
+      const rcFiles = [
+        path.join(os.homedir(), '.bashrc'),
+        path.join(os.homedir(), '.bash_profile'),
+        path.join(os.homedir(), '.zshrc'),
+        path.join(os.homedir(), '.zprofile'),
+        path.join(os.homedir(), '.profile')
+      ];
+
+      rcFiles.forEach(rcPath => {
+        if (fs.existsSync(rcPath) && fs.accessSync(rcPath, fs.constants.W_OK)) {
+          try {
+            const content = fs.readFileSync(rcPath, 'utf8');
+            const lines = content.split('\n');
+            const originalCount = lines.length;
+            const newLines = lines.filter(line => {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('#')) return true;
+              return !trimmed.includes('ANTHROPIC_');
+            });
+            if (newLines.length < originalCount) {
+              const removed = originalCount - newLines.length;
+              const timestamp = Date.now();
+              const backupFile = `${rcPath}.bak.${timestamp}`;
+              fs.copyFileSync(rcPath, backupFile);
+              fs.writeFileSync(rcPath, newLines.join('\n'), { mode: 0o644 });
+              console.log(`✓ Cleaned ${rcPath}: removed ${removed} ANTHROPIC_ line(s)`);
+              console.log(`  Backup: ${backupFile}`);
+              cleanedCount++;
+            }
+          } catch (e) {
+            console.log(`✗ Failed to clean ${rcPath}: ${e.message}`);
+          }
+        }
+      });
+
+      // Clean 4: Unset all ANTHROPIC from current process
+      const allKeys = [
+        'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_AUTH_TOKEN',
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_MODEL',
+        'API_TIMEOUT_MS'
+      ];
+      let unsetCount = 0;
+      allKeys.forEach(key => {
+        if (process.env[key] !== undefined) {
+          delete process.env[key];
+          unsetCount++;
+        }
+      });
+      if (unsetCount > 0) {
+        console.log(`✓ Unset ${unsetCount} ANTHROPIC_* environment variable(s) in current session');
+      }
+
+      console.log();
+      console.log('=== Clean Complete ===');
+      console.log('✓ All ANTHROPIC configuration has been cleaned from all locations.');
+      console.log();
+      console.log('Next steps (to set up your profile again):');
+      console.log('  1. Disconnect SSH completely and reconnect');
+      console.log('  2. Verify clean: claude-proxy doctor');
+      console.log('  3. Switch to your profile: claude-proxy use <profile-name>');
+      console.log('  4. Start Claude Code: claude');
+    });
+
   program.parse();
 }
 
