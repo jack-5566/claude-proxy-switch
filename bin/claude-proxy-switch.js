@@ -17,6 +17,9 @@ const PROFILE_ENV_KEYS = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'API_TIMEOUT_MS',
   'HTTP_PROXY',
   'HTTPS_PROXY'
@@ -207,6 +210,31 @@ function printEnvEntries(entries) {
   });
 }
 
+function syncModelEnv(profile) {
+  if (!profile || typeof profile !== 'object') {
+    return profile;
+  }
+
+  const normalized = { ...profile };
+  const baseUrl = normalized.ANTHROPIC_BASE_URL;
+  const model = normalized.ANTHROPIC_MODEL;
+  const isMimo = baseUrl === 'https://api.xiaomimimo.com/anthropic' || model === 'mimo-v2-pro';
+
+  if (isMimo) {
+    const mimoModel = 'mimo-v2-pro';
+    delete normalized.ANTHROPIC_MODEL;
+    normalized.ANTHROPIC_DEFAULT_HAIKU_MODEL = mimoModel;
+    normalized.ANTHROPIC_DEFAULT_SONNET_MODEL = mimoModel;
+    normalized.ANTHROPIC_DEFAULT_OPUS_MODEL = mimoModel;
+    return normalized;
+  }
+
+  delete normalized.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  delete normalized.ANTHROPIC_DEFAULT_SONNET_MODEL;
+  delete normalized.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  return normalized;
+}
+
 function stripManagedEnv(settings, keysToStrip) {
   const normalized = typeof settings === 'object' && settings !== null ? settings : {};
   const env = normalized.env && typeof normalized.env === 'object' ? { ...normalized.env } : {};
@@ -277,7 +305,7 @@ function main() {
       }
       if (options.timeout) profile.API_TIMEOUT_MS = options.timeout;
 
-      config.profiles[name] = profile;
+      config.profiles[name] = syncModelEnv(profile);
       if (!config.current) {
         config.current = name;
       }
@@ -336,9 +364,10 @@ function main() {
     .description('Switch to a proxy profile (updates Claude Code settings)')
     .action(name => {
       const config = loadProfiles();
-      const profile = config.profiles[name];
+      const rawProfile = config.profiles[name];
+      const profile = syncModelEnv(rawProfile);
 
-      if (!profile) {
+      if (!rawProfile) {
         console.log(`Profile '${name}' not found`);
         console.log(`Available profiles: ${Object.keys(config.profiles).join(', ') || '(none)'}`);
         process.exit(1);
@@ -349,6 +378,7 @@ function main() {
       PROFILE_ENV_KEYS.forEach(key => delete preservedEnv[key]);
       settings.env = { ...preservedEnv, ...profile };
 
+      config.profiles[name] = profile;
       config.current = name;
       saveProfiles(config);
       saveClaudeSettings(settings);
