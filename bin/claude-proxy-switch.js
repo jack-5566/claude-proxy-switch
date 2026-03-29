@@ -310,7 +310,7 @@ function main() {
           console.log(`      ${key}=${display}`);
         });
         console.log('   ⚠️  Environment variables OVERRIDE ALL configuration files!');
-        console.log('   Fix: unset these variables and remove them from your shell rc file\n');
+        console.log('   Fix with: claude-proxy fix\n');
       } else {
         console.log('   ✓ No conflicting environment variables found\n');
       }
@@ -337,7 +337,7 @@ function main() {
                 console.log(`      ${key}=${display}`);
               });
               console.log('   ⚠️  Claude Code may use this over settings.local.json');
-              console.log('   Fix: echo "{}" > ~/.claude/settings.json\n');
+              console.log('   Fix with: claude-proxy fix\n');
             }
           }
           if (!hasSettingsJsonConflict) {
@@ -403,9 +403,9 @@ function main() {
         '/etc/zshrc'
       ];
 
-      let foundInRc = false;
+      const conflictFiles = [];
       rcFiles.forEach(rcPath => {
-        if (fs.existsSync(rcPath)) {
+        if (fs.existsSync(rcPath) && fs.accessSync(rcPath, fs.constants.W_OK)) {
           try {
             const content = fs.readFileSync(rcPath, 'utf8');
             const lines = content.split('\n');
@@ -413,34 +413,124 @@ function main() {
               !line.startsWith('#') && line.includes('ANTHROPIC_')
             );
             if (hasAnthropic) {
-              foundInRc = true;
+              conflictFiles.push(rcPath);
               console.log(`   ⚠️  Found ANTHROPIC_ references in: ${rcPath}`);
-              console.log('   You need to edit this file and remove the export lines');
+              console.log('   Fix with: claude-proxy fix\n');
             }
           } catch (e) {
             // ignore read errors
           }
         }
       });
-      if (!foundInRc) {
-        console.log('   ✓ No ANTHROPIC_* found in common shell rc files');
+      if (conflictFiles.length === 0) {
+        console.log('   ✓ No ANTHROPIC_* found in writable shell rc files');
       }
 
       console.log();
 
       // Summary
+      const totalConflicts = conflictingEnv.length + (hasSettingsJsonConflict ? 1 : 0) + conflictFiles.length;
       console.log('=== Summary ===');
-      if (conflictingEnv.length === 0 && !hasSettingsJsonConflict && !foundInRc) {
+      if (totalConflicts === 0) {
         console.log('✓ No conflicts detected in checked locations.');
         console.log('If switch still not working:');
         console.log('  1. Fully restart your SSH session (disconnect and reconnect)');
         console.log('  2. Fully restart Claude Code after reconnecting');
         console.log('  3. Verify your token is correct for the target API');
       } else {
-        console.log('⚠️  Conflicts detected above. Please fix them before switching.');
-        console.log('   After fixing, disconnect SSH and reconnect, then:');
-        console.log('   claude-proxy use <profile-name>');
-        console.log('   claude');
+        console.log(`⚠️  ${totalConflicts} conflict(s) detected.`);
+        console.log('   Run `claude-proxy fix` to automatically fix them.');
+        console.log('   After fixing: disconnect SSH → reconnect → claude-proxy use <profile> → claude');
+      }
+    });
+
+  program
+    .command('fix')
+    .description('Automatically fix detected configuration conflicts')
+    .action(() => {
+      console.log('=== Claude Proxy Configuration Fix ===\n');
+
+      let fixedCount = 0;
+
+      // Fix 1: Clear settings.json ANTHROPIC config
+      const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
+      if (fs.existsSync(SETTINGS_JSON)) {
+        try {
+          const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
+          if (settingsJson.env) {
+            const anthropicKeys = Object.keys(settingsJson.env).filter(key =>
+              key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY'
+            );
+            if (anthropicKeys.length > 0) {
+              anthropicKeys.forEach(key => delete settingsJson.env[key]);
+              if (Object.keys(settingsJson.env).length === 0) {
+                delete settingsJson.env;
+              }
+              // Create backup before modifying
+              const timestamp = Date.now();
+              const backupFile = `${SETTINGS_JSON}.bak.${timestamp}`;
+              fs.copyFileSync(SETTINGS_JSON, backupFile);
+              fs.writeFileSync(SETTINGS_JSON, JSON.stringify(settingsJson, null, 2), { mode: 0o600 });
+              console.log(`✓ Fixed settings.json: removed ${anthropicKeys.length} ANTHROPIC_* field(s)`);
+              console.log(`  Backup: ${backupFile}`);
+              fixedCount++;
+            }
+          }
+        } catch (e) {
+          console.log(`✗ Failed to fix settings.json: ${e.message}`);
+        }
+      }
+
+      // Fix 2: Remove ANTHROPIC lines from shell rc files
+      const rcFiles = [
+        path.join(os.homedir(), '.bashrc'),
+        path.join(os.homedir(), '.bash_profile'),
+        path.join(os.homedir(), '.zshrc'),
+        path.join(os.homedir(), '.zprofile'),
+        path.join(os.homedir(), '.profile')
+      ];
+
+      rcFiles.forEach(rcPath => {
+        if (fs.existsSync(rcPath) && fs.accessSync(rcPath, fs.constants.W_OK)) {
+          try {
+            const content = fs.readFileSync(rcPath, 'utf8');
+            const lines = content.split('\n');
+            const originalCount = lines.length;
+            // Keep lines that don't have uncommented ANTHROPIC_
+            const newLines = lines.filter(line => {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('#')) return true;
+              return !trimmed.includes('ANTHROPIC_');
+            });
+            if (newLines.length < originalCount) {
+              const removed = originalCount - newLines.length;
+              // Create backup
+              const timestamp = Date.now();
+              const backupFile = `${rcPath}.bak.${timestamp}`;
+              fs.copyFileSync(rcPath, backupFile);
+              fs.writeFileSync(rcPath, newLines.join('\n'), { mode: 0o644 });
+              console.log(`✓ Fixed ${rcPath}: removed ${removed} ANTHROPIC_ line(s)`);
+              console.log(`  Backup: ${backupFile}`);
+              fixedCount++;
+            }
+          } catch (e) {
+            console.log(`✗ Failed to fix ${rcPath}: ${e.message}`);
+          }
+        }
+      });
+
+      console.log();
+      console.log('=== Fix Complete ===');
+      if (fixedCount > 0) {
+        console.log(`✓ Fixed ${fixedCount} file(s)`);
+        console.log();
+        console.log('Next steps:');
+        console.log('  1. Disconnect from SSH completely');
+        console.log('  2. Reconnect to SSH');
+        console.log('  3. Run: claude-proxy use <your-profile-name>');
+        console.log('  4. Start Claude Code: claude');
+      } else {
+        console.log('✓ No conflicts needed fixing');
       }
     });
 
