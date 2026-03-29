@@ -63,6 +63,26 @@ function saveClaudeSettings(settings) {
     }
   }
 
+  // Check for conflicting environment variables in the current shell
+  const conflictingEnv = [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_MODEL'
+  ].filter(key => process.env[key] !== undefined);
+
+  if (conflictingEnv.length > 0) {
+    console.log('\n⚠️  Warning: Found ANTHROPIC_* environment variables already set');
+    console.log('   Environment variables override ALL configuration files');
+    console.log('   Conflicting vars: ' + conflictingEnv.join(', '));
+    console.log('   To fix for current session, run:');
+    conflictingEnv.forEach(key => {
+      console.log(`     unset ${key}`);
+    });
+    console.log('   And remove them from your shell rc file (~/.zshrc, ~/.bashrc, etc.)');
+    console.log();
+  }
+
   // Create backup before modifying
   if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
     const timestamp = Date.now();
