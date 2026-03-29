@@ -450,6 +450,7 @@ function main() {
       } else {
         console.log(`⚠️  ${totalConflicts} conflict(s) detected.`);
         console.log('   Run `claude-proxy fix` to automatically fix them.');
+        console.log('   Fix will: remove lines from rc files, clear settings.json, and unset current env vars');
         console.log('   After fixing: disconnect SSH → reconnect → claude-proxy use <profile> → claude');
       }
     });
@@ -555,16 +556,35 @@ function main() {
         }
       });
 
+      // Also unset conflicting environment variables in current process
+      const allKeys = [
+        'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_AUTH_TOKEN',
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_MODEL',
+        'API_TIMEOUT_MS'
+      ];
+      let unsetCount = 0;
+      allKeys.forEach(key => {
+        if (process.env[key] !== undefined) {
+          delete process.env[key];
+          unsetCount++;
+        }
+      });
+      if (unsetCount > 0) {
+        console.log(`✓ Unset ${unsetCount} ANTHROPIC_* environment variable(s) in current session`);
+        console.log('   Note: This only affects the current shell session');
+      }
+
       console.log();
       console.log('=== Fix Complete ===');
-      if (fixedCount > 0) {
-        console.log(`✓ Fixed ${fixedCount} file(s)`);
+      if (fixedCount > 0 || unsetCount > 0) {
+        console.log(`✓ Fixed ${fixedCount} file(s), unset ${unsetCount} variable(s)`);
         console.log();
         console.log('Next steps:');
-        console.log('  1. Disconnect from SSH completely');
-        console.log('  2. Reconnect to SSH');
-        console.log('  3. Run: claude-proxy use <your-profile-name>');
-        console.log('  4. Start Claude Code: claude');
+        console.log('  1. For permanent fix: disconnect SSH and reconnect');
+        console.log('  2. Then run: claude-proxy use <your-profile-name>');
+        console.log('  3. Then start Claude Code: claude');
       } else {
         console.log('✓ No conflicts needed fixing');
       }
