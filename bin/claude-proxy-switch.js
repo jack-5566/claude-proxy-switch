@@ -300,6 +300,12 @@ function main() {
         'API_TIMEOUT_MS'
       ].filter(key => process.env[key] !== undefined);
 
+      // Check for both token and api-key conflict
+      if (process.env.ANTHROPIC_AUTH_TOKEN && process.env.ANTHROPIC_API_KEY) {
+        console.log('   ⚠️  Both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY are set');
+        console.log('   This causes an auth conflict. Fix with: claude-proxy fix\n');
+      }
+
       if (conflictingEnv.length > 0) {
         console.log('   ⚠️  Found ANTHROPIC_* environment variables:');
         conflictingEnv.forEach(key => {
@@ -336,6 +342,10 @@ function main() {
                   : val;
                 console.log(`      ${key}=${display}`);
               });
+              // Check for auth conflict
+              if (settingsJson.env.ANTHROPIC_AUTH_TOKEN && settingsJson.env.ANTHROPIC_API_KEY) {
+                console.log('   ⚠️  Both AUTH_TOKEN and API_KEY set - this causes auth conflict');
+              }
               console.log('   ⚠️  Claude Code may use this over settings.local.json');
               console.log('   Fix with: claude-proxy fix\n');
             }
@@ -466,6 +476,10 @@ function main() {
               if (Object.keys(settingsJson.env).length === 0) {
                 delete settingsJson.env;
               }
+              // Check for auth conflict after removal
+              if (settingsJson.env && settingsJson.env.ANTHROPIC_AUTH_TOKEN && settingsJson.env.ANTHROPIC_API_KEY) {
+                console.log('   ⚠️  Found both AUTH_TOKEN and API_KEY, keeping both (manual fix needed)');
+              }
               // Create backup before modifying
               const timestamp = Date.now();
               const backupFile = `${SETTINGS_JSON}.bak.${timestamp}`;
@@ -478,6 +492,28 @@ function main() {
           }
         } catch (e) {
           console.log(`✗ Failed to fix settings.json: ${e.message}`);
+        }
+      }
+
+      // Fix 2: Also check settings.local.json for double auth conflict
+      if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
+        try {
+          const settingsLocal = loadClaudeSettings();
+          if (settingsLocal.env &&
+              settingsLocal.env.ANTHROPIC_AUTH_TOKEN &&
+              settingsLocal.env.ANTHROPIC_API_KEY) {
+            // If we have both, remove ANTHROPIC_API_KEY since profiles use ANTHROPIC_AUTH_TOKEN
+            delete settingsLocal.env.ANTHROPIC_API_KEY;
+            const timestamp = Date.now();
+            const backupFile = `${CLAUDE_SETTINGS_FILE}.bak.${timestamp}`;
+            fs.copyFileSync(CLAUDE_SETTINGS_FILE, backupFile);
+            saveClaudeSettings(settingsLocal);
+            console.log(`✓ Fixed settings.local.json: removed conflicting ANTHROPIC_API_KEY`);
+            console.log(`  Backup: ${backupFile}`);
+            fixedCount++;
+          }
+        } catch (e) {
+          console.log(`✗ Failed to fix settings.local.json: ${e.message}`);
         }
       }
 
