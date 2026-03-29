@@ -44,6 +44,25 @@ function loadClaudeSettings() {
 
 // Save Claude settings atomically
 function saveClaudeSettings(settings) {
+  // Check if settings.json has conflicting env configuration
+  const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
+  if (fs.existsSync(SETTINGS_JSON)) {
+    try {
+      const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
+      if (settingsJson.env && Object.keys(settingsJson.env).some(key =>
+        key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY'
+      )) {
+        console.log('\n⚠️  Warning: Found ANTHROPIC_* configuration in settings.json');
+        console.log('   Claude Code may use settings.json over settings.local.json');
+        console.log('   If switching does not take effect, run:');
+        console.log('     echo "{}" > ~/.claude/settings.json');
+        console.log();
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+  }
+
   // Create backup before modifying
   if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
     const timestamp = Date.now();
