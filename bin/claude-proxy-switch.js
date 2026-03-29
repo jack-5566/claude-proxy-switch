@@ -304,7 +304,7 @@ function main() {
         console.log('   ⚠️  Found ANTHROPIC_* environment variables:');
         conflictingEnv.forEach(key => {
           const val = process.env[key];
-          const display = key.includes('TOKEN') || key.includes('KEY') && val.length > 8
+          const display = (key.includes('TOKEN') || key.includes('KEY')) && val.length > 8
             ? val.substring(0, 4) + '...' + val.substring(val.length - 4)
             : val;
           console.log(`      ${key}=${display}`);
@@ -389,18 +389,58 @@ function main() {
       } else {
         console.log('   ⚠️  No saved profiles\n');
       }
+
+      // Check 5: Check shell rc files for environment variables
+      console.log('\n5. Checking common shell rc files for ANTHROPIC config:');
+      const rcFiles = [
+        path.join(os.homedir(), '.bashrc'),
+        path.join(os.homedir(), '.bash_profile'),
+        path.join(os.homedir(), '.zshrc'),
+        path.join(os.homedir(), '.zprofile'),
+        path.join(os.homedir(), '.profile'),
+        '/etc/profile',
+        '/etc/bashrc',
+        '/etc/zshrc'
+      ];
+
+      let foundInRc = false;
+      rcFiles.forEach(rcPath => {
+        if (fs.existsSync(rcPath)) {
+          try {
+            const content = fs.readFileSync(rcPath, 'utf8');
+            const lines = content.split('\n');
+            const hasAnthropic = lines.some(line =>
+              !line.startsWith('#') && line.includes('ANTHROPIC_')
+            );
+            if (hasAnthropic) {
+              foundInRc = true;
+              console.log(`   ⚠️  Found ANTHROPIC_ references in: ${rcPath}`);
+              console.log('   You need to edit this file and remove the export lines');
+            }
+          } catch (e) {
+            // ignore read errors
+          }
+        }
+      });
+      if (!foundInRc) {
+        console.log('   ✓ No ANTHROPIC_* found in common shell rc files');
+      }
+
       console.log();
 
       // Summary
       console.log('=== Summary ===');
-      if (conflictingEnv.length === 0 && !hasSettingsJsonConflict) {
-        console.log('✓ No conflicts detected. If switch still not working:');
-        console.log('  1. Make sure you fully restart Claude Code');
-        console.log('  2. Check that your profile has the correct ANTHROPIC_BASE_URL');
+      if (conflictingEnv.length === 0 && !hasSettingsJsonConflict && !foundInRc) {
+        console.log('✓ No conflicts detected in checked locations.');
+        console.log('If switch still not working:');
+        console.log('  1. Fully restart your SSH session (disconnect and reconnect)');
+        console.log('  2. Fully restart Claude Code after reconnecting');
+        console.log('  3. Verify your token is correct for the target API');
       } else {
         console.log('⚠️  Conflicts detected above. Please fix them before switching.');
-        console.log('   After fixing, run: claude-proxy use <profile-name>');
-        console.log('   Then fully restart Claude Code.');
+        console.log('   After fixing, disconnect SSH and reconnect, then:');
+        console.log('   claude-proxy use <profile-name>');
+        console.log('   claude');
       }
     });
 
