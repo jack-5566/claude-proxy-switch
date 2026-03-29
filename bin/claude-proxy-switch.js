@@ -5,113 +5,245 @@ const os = require('os');
 const path = require('path');
 const { Command } = require('commander');
 
-// Configuration paths
-const CONFIG_DIR = path.join(os.homedir(), '.claude-profiles');
+const HOME = os.homedir();
+const CLAUDE_DIR = path.join(HOME, '.claude');
+const CONFIG_DIR = path.join(HOME, '.claude-profiles');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'profiles.json');
-const CLAUDE_SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.local.json');
+const CLAUDE_SETTINGS_FILE = path.join(CLAUDE_DIR, 'settings.json');
+const LEGACY_SETTINGS_LOCAL_FILE = path.join(CLAUDE_DIR, 'settings.local.json');
 
-// Ensure config directory exists
-function ensureConfigDir() {
-  if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  }
-  if (!fs.existsSync(CONFIG_FILE)) {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ current: null, profiles: {} }, null, 2), { mode: 0o600 });
+const PROFILE_ENV_KEYS = [
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_MODEL',
+  'API_TIMEOUT_MS',
+  'HTTP_PROXY',
+  'HTTPS_PROXY'
+];
+
+const SHELL_RC_FILES = [
+  path.join(HOME, '.bashrc'),
+  path.join(HOME, '.bash_profile'),
+  path.join(HOME, '.zshrc'),
+  path.join(HOME, '.zprofile'),
+  path.join(HOME, '.profile')
+];
+
+const SYSTEM_RC_FILES = ['/etc/profile', '/etc/bashrc', '/etc/zshrc'];
+
+function ensureDir(dirPath, mode) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true, mode });
   }
 }
 
-// Load all profiles
+function ensureConfigDir() {
+  ensureDir(CONFIG_DIR, 0o700);
+  if (!fs.existsSync(CONFIG_FILE)) {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ current: null, profiles: {} }, null, 2), {
+      mode: 0o600
+    });
+  }
+}
+
+function readJson(filePath, fallback = null) {
+  if (!fs.existsSync(filePath)) {
+    return fallback;
+  }
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function writeJsonAtomic(filePath, data, mode = 0o600) {
+  ensureDir(path.dirname(filePath), 0o700);
+  const tempFile = `${filePath}.tmp.${process.pid}`;
+  fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), { mode });
+  fs.renameSync(tempFile, filePath);
+}
+
+function backupFile(filePath) {
+  const backupPath = `${filePath}.bak.${Date.now()}`;
+  fs.copyFileSync(filePath, backupPath);
+  return backupPath;
+}
+
+function canWriteFile(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.W_OK);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function maskValue(key, value) {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  if ((key.includes('TOKEN') || key.includes('KEY')) && value.length > 8) {
+    return `${value.slice(0, 4)}...${value.slice(-4)}`;
+  }
+  return value;
+}
+
+function isManagedEnvKey(key) {
+  return PROFILE_ENV_KEYS.includes(key);
+}
+
+function isManagedConfigLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) {
+    return false;
+  }
+  return PROFILE_ENV_KEYS.some(key => trimmed.includes(key));
+}
+
 function loadProfiles() {
   ensureConfigDir();
-  const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-  return JSON.parse(data);
+  return readJson(CONFIG_FILE, { current: null, profiles: {} });
 }
 
-// Save all profiles
 function saveProfiles(data) {
   ensureConfigDir();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
+  writeJsonAtomic(CONFIG_FILE, data, 0o600);
 }
 
-// Load Claude settings
 function loadClaudeSettings() {
-  if (!fs.existsSync(CLAUDE_SETTINGS_FILE)) {
-    return { env: {} };
-  }
-  const data = fs.readFileSync(CLAUDE_SETTINGS_FILE, 'utf8');
-  return JSON.parse(data);
+  return readJson(CLAUDE_SETTINGS_FILE, { env: {} }) || { env: {} };
 }
 
-// Save Claude settings atomically
 function saveClaudeSettings(settings) {
-  // Check if settings.json has conflicting env configuration
-  const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
-  if (fs.existsSync(SETTINGS_JSON)) {
-    try {
-      const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
-      if (settingsJson.env && Object.keys(settingsJson.env).some(key =>
-        key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY'
-      )) {
-        console.log('\n⚠️  Warning: Found ANTHROPIC_* configuration in settings.json');
-        console.log('   Claude Code may use settings.json over settings.local.json');
-        console.log('   If switching does not take effect, run:');
-        console.log('     echo "{}" > ~/.claude/settings.json');
-        console.log();
-      }
-    } catch (e) {
-      // Ignore parse errors
-    }
+  const normalized = typeof settings === 'object' && settings !== null ? settings : {};
+  if (!normalized.env || typeof normalized.env !== 'object') {
+    normalized.env = {};
   }
 
-  // Check for conflicting environment variables in the current shell
-  const conflictingEnv = [
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_MODEL'
-  ].filter(key => process.env[key] !== undefined);
-
-  if (conflictingEnv.length > 0) {
-    console.log('\n⚠️  Warning: Found ANTHROPIC_* environment variables already set');
-    console.log('   Environment variables override ALL configuration files');
-    console.log('   Conflicting vars: ' + conflictingEnv.join(', '));
-    console.log('   To fix for current session, run:');
-    conflictingEnv.forEach(key => {
-      console.log(`     unset ${key}`);
-    });
-    console.log('   And remove them from your shell rc file (~/.zshrc, ~/.bashrc, etc.)');
-    console.log();
+  const shellConflicts = PROFILE_ENV_KEYS.filter(key => process.env[key] !== undefined);
+  if (shellConflicts.length > 0) {
+    console.log('\nWarning: managed environment variables are already set in this shell');
+    console.log(`  Conflicting vars: ${shellConflicts.join(', ')}`);
+    console.log('  They override Claude config files. Run `claude-proxy doctor` for cleanup guidance.\n');
   }
 
-  // Create backup before modifying
   if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
-    const timestamp = Date.now();
-    const backupFile = `${CLAUDE_SETTINGS_FILE}.bak.${timestamp}`;
-    fs.copyFileSync(CLAUDE_SETTINGS_FILE, backupFile);
-    console.log(`  Backup created: ${backupFile}`);
+    const backupPath = backupFile(CLAUDE_SETTINGS_FILE);
+    console.log(`  Backup created: ${backupPath}`);
   }
 
-  // Ensure parent directory exists
-  const claudeDir = path.dirname(CLAUDE_SETTINGS_FILE);
-  if (!fs.existsSync(claudeDir)) {
-    fs.mkdirSync(claudeDir, { recursive: true });
-  }
-
-  // Atomic write: write to temp file then rename
-  const tempFile = `${CLAUDE_SETTINGS_FILE}.tmp.${process.pid}`;
-  fs.writeFileSync(tempFile, JSON.stringify(settings, null, 2), { mode: 0o600 });
-  fs.renameSync(tempFile, CLAUDE_SETTINGS_FILE);
+  writeJsonAtomic(CLAUDE_SETTINGS_FILE, normalized, 0o600);
 }
 
-// Find matching profile by current config
 function findCurrentProfile(profiles, currentSettings) {
   if (!currentSettings.env || !currentSettings.env.ANTHROPIC_BASE_URL) {
     return null;
   }
   const currentBaseUrl = currentSettings.env.ANTHROPIC_BASE_URL;
-  return Object.entries(profiles.profiles).find(([_, p]) =>
-    p.ANTHROPIC_BASE_URL === currentBaseUrl
-  );
+  return Object.entries(profiles.profiles).find(([, profile]) => {
+    return profile.ANTHROPIC_BASE_URL === currentBaseUrl;
+  }) || null;
+}
+
+function collectProcessEnvConflicts() {
+  return PROFILE_ENV_KEYS.filter(key => process.env[key] !== undefined).map(key => ({
+    key,
+    value: process.env[key]
+  }));
+}
+
+function collectSettingsFileConflicts(filePath) {
+  const result = {
+    filePath,
+    exists: fs.existsSync(filePath),
+    parseError: null,
+    keys: [],
+    data: null
+  };
+
+  if (!result.exists) {
+    return result;
+  }
+
+  try {
+    result.data = readJson(filePath, {});
+    const env = result.data && typeof result.data.env === 'object' ? result.data.env : {};
+    result.keys = Object.keys(env).filter(isManagedEnvKey);
+  } catch (error) {
+    result.parseError = error;
+  }
+
+  return result;
+}
+
+function collectRcFileConflicts(rcFiles) {
+  return rcFiles.map(filePath => {
+    const info = {
+      filePath,
+      exists: fs.existsSync(filePath),
+      writable: false,
+      parseError: null,
+      lineCount: 0
+    };
+
+    if (!info.exists) {
+      return info;
+    }
+
+    info.writable = canWriteFile(filePath);
+
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      info.lineCount = content.split('\n').filter(isManagedConfigLine).length;
+    } catch (error) {
+      info.parseError = error;
+    }
+
+    return info;
+  });
+}
+
+function printEnvEntries(entries) {
+  entries.forEach(([key, value]) => {
+    console.log(`  ${key}: ${maskValue(key, value)}`);
+  });
+}
+
+function stripManagedEnv(settings, keysToStrip) {
+  const normalized = typeof settings === 'object' && settings !== null ? settings : {};
+  const env = normalized.env && typeof normalized.env === 'object' ? { ...normalized.env } : {};
+  let removed = 0;
+
+  keysToStrip.forEach(key => {
+    if (key in env) {
+      delete env[key];
+      removed += 1;
+    }
+  });
+
+  if (Object.keys(env).length === 0) {
+    delete normalized.env;
+  } else {
+    normalized.env = env;
+  }
+
+  return { settings: normalized, removed };
+}
+
+function cleanRcFile(filePath) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n');
+  const cleanedLines = lines.filter(line => !isManagedConfigLine(line));
+  return {
+    removed: lines.length - cleanedLines.length,
+    content: cleanedLines.join('\n')
+  };
+}
+
+function printRestartSteps() {
+  console.log('Next steps:');
+  console.log('  1. Restart your shell session or reconnect to SSH');
+  console.log('  2. Run `claude-proxy doctor` to confirm a clean state');
+  console.log('  3. Run `claude-proxy use <profile-name>`');
+  console.log('  4. Restart Claude Code');
 }
 
 function main() {
@@ -120,23 +252,24 @@ function main() {
   program
     .name('claude-proxy')
     .description('Quickly switch between different Claude Code proxy/relay configurations')
-    .version('1.0.0');
+    .version('1.1.0');
 
   program
     .command('add <name> <baseUrl>')
     .description('Add a new proxy profile')
-    .option('-t, --token <token>', 'Anthropic auth token')
+    .option('-t, --token <token>', 'Anthropic auth token (Authorization bearer token)')
+    .option('-a, --api-key <apiKey>', 'Anthropic API key (x-api-key)')
     .option('-m, --model <model>', 'Model name')
     .option('-p, --proxy <proxyUrl>', 'HTTP/HTTPS proxy URL')
     .option('-k, --timeout <ms>', 'API timeout in milliseconds')
     .action((name, baseUrl, options) => {
       const config = loadProfiles();
-
-      // Build profile
       const profile = {
         ANTHROPIC_BASE_URL: baseUrl
       };
+
       if (options.token) profile.ANTHROPIC_AUTH_TOKEN = options.token;
+      if (options.apiKey) profile.ANTHROPIC_API_KEY = options.apiKey;
       if (options.model) profile.ANTHROPIC_MODEL = options.model;
       if (options.proxy) {
         profile.HTTP_PROXY = options.proxy;
@@ -145,28 +278,32 @@ function main() {
       if (options.timeout) profile.API_TIMEOUT_MS = options.timeout;
 
       config.profiles[name] = profile;
-      if (!config.current) config.current = name;
+      if (!config.current) {
+        config.current = name;
+      }
 
       saveProfiles(config);
-      console.log(`✓ Added profile '${name}'`);
+      console.log(`Added profile '${name}'`);
       console.log(`  Base URL: ${baseUrl}`);
     });
 
   program
     .command('remove <name>')
     .description('Remove a proxy profile')
-    .action((name) => {
+    .action(name => {
       const config = loadProfiles();
       if (!config.profiles[name]) {
-        console.log(`✗ Profile '${name}' not found`);
+        console.log(`Profile '${name}' not found`);
         process.exit(1);
       }
+
       delete config.profiles[name];
       if (config.current === name) {
         config.current = Object.keys(config.profiles)[0] || null;
       }
+
       saveProfiles(config);
-      console.log(`✓ Removed profile '${name}'`);
+      console.log(`Removed profile '${name}'`);
     });
 
   program
@@ -188,9 +325,8 @@ function main() {
 
       console.log('Available profiles:');
       names.forEach(name => {
-        const profile = config.profiles[name];
         const marker = name === currentName ? '*' : ' ';
-        console.log(`  ${marker} ${name.padEnd(12)} ${profile.ANTHROPIC_BASE_URL}`);
+        console.log(`  ${marker} ${name.padEnd(12)} ${config.profiles[name].ANTHROPIC_BASE_URL}`);
       });
     });
 
@@ -198,37 +334,30 @@ function main() {
     .command('use <name>')
     .alias('switch')
     .description('Switch to a proxy profile (updates Claude Code settings)')
-    .action((name) => {
+    .action(name => {
       const config = loadProfiles();
+      const profile = config.profiles[name];
 
-      if (!config.profiles[name]) {
-        console.log(`✗ Profile '${name}' not found`);
-        console.log('Available profiles:', Object.keys(config.profiles).join(', ') || '(none)');
+      if (!profile) {
+        console.log(`Profile '${name}' not found`);
+        console.log(`Available profiles: ${Object.keys(config.profiles).join(', ') || '(none)'}`);
         process.exit(1);
       }
 
       const settings = loadClaudeSettings();
-      const profile = config.profiles[name];
+      const preservedEnv = settings.env && typeof settings.env === 'object' ? { ...settings.env } : {};
+      PROFILE_ENV_KEYS.forEach(key => delete preservedEnv[key]);
+      settings.env = { ...preservedEnv, ...profile };
 
-      // Replace env completely - clear old fields to avoid configuration residue
-      // This fixes the issue where old API configurations persist and override new settings
-      settings.env = {};
-
-      // Assign all fields from the selected profile
-      Object.assign(settings.env, profile);
       config.current = name;
-
-      // Save
       saveProfiles(config);
       saveClaudeSettings(settings);
 
-      console.log(`✓ Switched to profile '${name}'`);
+      console.log(`Switched to profile '${name}'`);
       console.log(`  Updated: ${CLAUDE_SETTINGS_FILE}`);
       console.log('');
       console.log('Configuration:');
-      Object.entries(profile).forEach(([key, value]) => {
-        console.log(`  ${key}: ${value}`);
-      });
+      printEnvEntries(Object.entries(profile));
       console.log('');
       console.log('Restart Claude Code for changes to take effect.');
     });
@@ -249,16 +378,13 @@ function main() {
       if (match) {
         console.log(`Current active profile: ${match[0]}`);
         console.log('');
-        Object.entries(match[1]).forEach(([key, value]) => {
-          console.log(`  ${key}: ${value}`);
-        });
-      } else {
-        console.log('Current configuration does not match any saved profile.');
-        console.log('');
-        Object.entries(currentSettings.env).forEach(([key, value]) => {
-          console.log(`  ${key}: ${value}`);
-        });
+        printEnvEntries(Object.entries(match[1]));
+        return;
       }
+
+      console.log('Current configuration does not match any saved profile.');
+      console.log('');
+      printEnvEntries(Object.entries(currentSettings.env));
     });
 
   program
@@ -272,16 +398,9 @@ function main() {
         return;
       }
 
-      console.log('Current Claude Code configuration (settings.local.json):');
+      console.log('Current Claude Code configuration (~/.claude/settings.json):');
       console.log('');
-      Object.entries(settings.env).forEach(([key, value]) => {
-        // Mask token for security
-        let displayValue = value;
-        if (key === 'ANTHROPIC_AUTH_TOKEN' && value.length > 8) {
-          displayValue = value.substring(0, 4) + '...' + value.substring(value.length - 4);
-        }
-        console.log(`  ${key}: ${displayValue}`);
-      });
+      printEnvEntries(Object.entries(settings.env));
     });
 
   program
@@ -290,168 +409,83 @@ function main() {
     .action(() => {
       console.log('=== Claude Proxy Configuration Doctor ===\n');
 
-      // Check 1: Environment variables
-      console.log('1. Checking environment variables:');
-      const conflictingEnv = [
-        'ANTHROPIC_BASE_URL',
-        'ANTHROPIC_AUTH_TOKEN',
-        'ANTHROPIC_API_KEY',
-        'ANTHROPIC_MODEL',
-        'API_TIMEOUT_MS'
-      ].filter(key => process.env[key] !== undefined);
-
-      // Check for both token and api-key conflict
-      if (process.env.ANTHROPIC_AUTH_TOKEN && process.env.ANTHROPIC_API_KEY) {
-        console.log('   ⚠️  Both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY are set');
-        console.log('   This causes an auth conflict. Fix with: claude-proxy fix\n');
-      }
-
-      if (conflictingEnv.length > 0) {
-        console.log('   ⚠️  Found ANTHROPIC_* environment variables:');
-        conflictingEnv.forEach(key => {
-          const val = process.env[key];
-          const display = (key.includes('TOKEN') || key.includes('KEY')) && val.length > 8
-            ? val.substring(0, 4) + '...' + val.substring(val.length - 4)
-            : val;
-          console.log(`      ${key}=${display}`);
+      const processConflicts = collectProcessEnvConflicts();
+      console.log('1. Checking current shell environment:');
+      if (processConflicts.length === 0) {
+        console.log('   Clean');
+      } else {
+        console.log('   Conflicts found:');
+        processConflicts.forEach(({ key, value }) => {
+          console.log(`      ${key}=${maskValue(key, value)}`);
         });
-        console.log('   ⚠️  Environment variables OVERRIDE ALL configuration files!');
-        console.log('   Fix with: claude-proxy fix\n');
-      } else {
-        console.log('   ✓ No conflicting environment variables found\n');
       }
 
-      // Check 2: settings.json
-      console.log('2. Checking ~/.claude/settings.json:');
-      const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
-      let hasSettingsJsonConflict = false;
-      if (fs.existsSync(SETTINGS_JSON)) {
-        try {
-          const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
-          if (settingsJson.env) {
-            const anthropicKeys = Object.keys(settingsJson.env).filter(key =>
-              key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY'
-            );
-            if (anthropicKeys.length > 0) {
-              hasSettingsJsonConflict = true;
-              console.log('   ⚠️  Found ANTHROPIC_* configuration in settings.json:');
-              anthropicKeys.forEach(key => {
-                const val = settingsJson.env[key];
-                const display = (key.includes('TOKEN') || key.includes('KEY')) && val.length > 8
-                  ? val.substring(0, 4) + '...' + val.substring(val.length - 4)
-                  : val;
-                console.log(`      ${key}=${display}`);
-              });
-              // Check for auth conflict
-              if (settingsJson.env.ANTHROPIC_AUTH_TOKEN && settingsJson.env.ANTHROPIC_API_KEY) {
-                console.log('   ⚠️  Both AUTH_TOKEN and API_KEY set - this causes auth conflict');
-              }
-              console.log('   ⚠️  Claude Code may use this over settings.local.json');
-              console.log('   Fix with: claude-proxy fix\n');
-            }
-          }
-          if (!hasSettingsJsonConflict) {
-            console.log('   ✓ No conflicting ANTHROPIC_* configuration found\n');
-          }
-        } catch (e) {
-          console.log('   ⚠️  Failed to parse settings.json: ' + e.message + '\n');
+      const settingsJsonState = collectSettingsFileConflicts(CLAUDE_SETTINGS_FILE);
+      console.log('\n2. Checking ~/.claude/settings.json:');
+      if (!settingsJsonState.exists) {
+        console.log('   File does not exist');
+      } else if (settingsJsonState.parseError) {
+        console.log(`   Parse error: ${settingsJsonState.parseError.message}`);
+      } else if (settingsJsonState.keys.length === 0) {
+        console.log('   No managed keys currently set');
+      } else {
+        console.log(`   Managed keys: ${settingsJsonState.keys.join(', ')}`);
+      }
+
+      const legacyLocalState = collectSettingsFileConflicts(LEGACY_SETTINGS_LOCAL_FILE);
+      console.log('\n3. Checking legacy ~/.claude/settings.local.json:');
+      if (!legacyLocalState.exists) {
+        console.log('   File does not exist');
+      } else if (legacyLocalState.parseError) {
+        console.log(`   Parse error: ${legacyLocalState.parseError.message}`);
+      } else if (legacyLocalState.keys.length === 0) {
+        console.log('   No managed keys currently set');
+      } else {
+        console.log(`   Legacy managed keys: ${legacyLocalState.keys.join(', ')}`);
+      }
+
+      const profiles = loadProfiles();
+      const profileNames = Object.keys(profiles.profiles);
+      console.log('\n4. Checking saved profiles:');
+      if (profileNames.length === 0) {
+        console.log('   No saved profiles');
+      } else {
+        console.log(`   ${profileNames.length} saved profile(s):`);
+        profileNames.forEach(name => {
+          console.log(`      ${name.padEnd(12)} -> ${profiles.profiles[name].ANTHROPIC_BASE_URL}`);
+        });
+        if (profiles.current) {
+          console.log(`   Selected profile: ${profiles.current}`);
         }
-      } else {
-        console.log('   ✓ settings.json does not exist\n');
       }
 
-      // Check 3: settings.local.json
-      console.log('3. Checking ~/.claude/settings.local.json:');
-      if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
-        try {
-          const settingsLocal = loadClaudeSettings();
-          if (settingsLocal.env && Object.keys(settingsLocal.env).length > 0) {
-            console.log('   ✓ Configuration found:');
-            Object.entries(settingsLocal.env).forEach(([key, value]) => {
-              const display = (key.includes('TOKEN') || key.includes('KEY')) && value.length > 8
-                ? value.substring(0, 4) + '...' + value.substring(value.length - 4)
-                : value;
-              console.log(`      ${key}=${display}`);
-            });
+      const rcScan = collectRcFileConflicts([...SHELL_RC_FILES, ...SYSTEM_RC_FILES]);
+      console.log('\n5. Checking shell rc files for stale configuration:');
+      const rcConflicts = rcScan.filter(info => info.lineCount > 0 || info.parseError);
+      if (rcConflicts.length === 0) {
+        console.log('   No managed config lines found');
+      } else {
+        rcConflicts.forEach(info => {
+          if (info.parseError) {
+            console.log(`   ${info.filePath}: read error (${info.parseError.message})`);
           } else {
-            console.log('   ⚠️  settings.local.json exists but has no env configuration\n');
+            const suffix = info.writable ? '' : ' (not writable)';
+            console.log(`   ${info.filePath}: ${info.lineCount} managed line(s)${suffix}`);
           }
-        } catch (e) {
-          console.log('   ⚠️  Failed to parse settings.local.json: ' + e.message + '\n');
-        }
-      } else {
-        console.log('   ⚠️  settings.local.json does not exist\n');
-      }
-
-      // Check 4: Saved profiles
-      console.log('4. Checking saved profiles:');
-      const config = loadProfiles();
-      const names = Object.keys(config.profiles);
-      if (names.length > 0) {
-        console.log(`   ✓ ${names.length} saved profile(s):`);
-        names.forEach(name => {
-          const p = config.profiles[name];
-          console.log(`      ${name.padEnd(12)} → ${p.ANTHROPIC_BASE_URL}`);
         });
-        if (config.current) {
-          console.log(`   Current selected: ${config.current}`);
-        }
-      } else {
-        console.log('   ⚠️  No saved profiles\n');
       }
 
-      // Check 5: Check shell rc files for environment variables
-      console.log('\n5. Checking common shell rc files for ANTHROPIC config:');
-      const rcFiles = [
-        path.join(os.homedir(), '.bashrc'),
-        path.join(os.homedir(), '.bash_profile'),
-        path.join(os.homedir(), '.zshrc'),
-        path.join(os.homedir(), '.zprofile'),
-        path.join(os.homedir(), '.profile'),
-        '/etc/profile',
-        '/etc/bashrc',
-        '/etc/zshrc'
-      ];
+      const totalConflicts =
+        processConflicts.length +
+        rcScan.reduce((sum, info) => sum + info.lineCount, 0);
 
-      const conflictFiles = [];
-      rcFiles.forEach(rcPath => {
-        if (fs.existsSync(rcPath) && fs.accessSync(rcPath, fs.constants.W_OK)) {
-          try {
-            const content = fs.readFileSync(rcPath, 'utf8');
-            const lines = content.split('\n');
-            const hasAnthropic = lines.some(line =>
-              !line.startsWith('#') && line.includes('ANTHROPIC_')
-            );
-            if (hasAnthropic) {
-              conflictFiles.push(rcPath);
-              console.log(`   ⚠️  Found ANTHROPIC_ references in: ${rcPath}`);
-              console.log('   Fix with: claude-proxy fix\n');
-            }
-          } catch (e) {
-            // ignore read errors
-          }
-        }
-      });
-      if (conflictFiles.length === 0) {
-        console.log('   ✓ No ANTHROPIC_* found in writable shell rc files');
-      }
-
-      console.log();
-
-      // Summary
-      const totalConflicts = conflictingEnv.length + (hasSettingsJsonConflict ? 1 : 0) + conflictFiles.length;
-      console.log('=== Summary ===');
+      console.log('\n=== Summary ===');
       if (totalConflicts === 0) {
-        console.log('✓ No conflicts detected in checked locations.');
-        console.log('If switch still not working:');
-        console.log('  1. Fully restart your SSH session (disconnect and reconnect)');
-        console.log('  2. Fully restart Claude Code after reconnecting');
-        console.log('  3. Verify your token is correct for the target API');
+        console.log('No conflicts detected in the checked locations.');
+        console.log('If switching still fails, restart the shell session and then restart Claude Code.');
       } else {
-        console.log(`⚠️  ${totalConflicts} conflict(s) detected.`);
-        console.log('   Run `claude-proxy fix` to automatically fix them.');
-        console.log('   Fix will: remove lines from rc files, clear settings.json, and unset current env vars');
-        console.log('   After fixing: disconnect SSH → reconnect → claude-proxy use <profile> → claude');
+        console.log(`${totalConflicts} conflict item(s) detected.`);
+        console.log('Run `claude-proxy fix` for a safe cleanup or `claude-proxy clean` for a full reset.');
       }
     });
 
@@ -461,262 +495,130 @@ function main() {
     .action(() => {
       console.log('=== Claude Proxy Configuration Fix ===\n');
 
-      let fixedCount = 0;
+      let changedFiles = 0;
+      let unsetCount = 0;
 
-      // Fix 1: Clear settings.json ANTHROPIC config
-      const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
-      if (fs.existsSync(SETTINGS_JSON)) {
-        try {
-          const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
-          if (settingsJson.env) {
-            const anthropicKeys = Object.keys(settingsJson.env).filter(key =>
-              key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY'
-            );
-            if (anthropicKeys.length > 0) {
-              anthropicKeys.forEach(key => delete settingsJson.env[key]);
-              if (Object.keys(settingsJson.env).length === 0) {
-                delete settingsJson.env;
-              }
-              // Check for auth conflict after removal
-              if (settingsJson.env && settingsJson.env.ANTHROPIC_AUTH_TOKEN && settingsJson.env.ANTHROPIC_API_KEY) {
-                console.log('   ⚠️  Found both AUTH_TOKEN and API_KEY, keeping both (manual fix needed)');
-              }
-              // Create backup before modifying
-              const timestamp = Date.now();
-              const backupFile = `${SETTINGS_JSON}.bak.${timestamp}`;
-              fs.copyFileSync(SETTINGS_JSON, backupFile);
-              fs.writeFileSync(SETTINGS_JSON, JSON.stringify(settingsJson, null, 2), { mode: 0o600 });
-              console.log(`✓ Fixed settings.json: removed ${anthropicKeys.length} ANTHROPIC_* field(s)`);
-              console.log(`  Backup: ${backupFile}`);
-              fixedCount++;
-            }
-          }
-        } catch (e) {
-          console.log(`✗ Failed to fix settings.json: ${e.message}`);
+      const settingsJsonState = collectSettingsFileConflicts(CLAUDE_SETTINGS_FILE);
+      if (settingsJsonState.exists && !settingsJsonState.parseError && settingsJsonState.data) {
+        const hasDoubleAuth =
+          settingsJsonState.data.env &&
+          settingsJsonState.data.env.ANTHROPIC_AUTH_TOKEN &&
+          settingsJsonState.data.env.ANTHROPIC_API_KEY;
+
+        if (hasDoubleAuth) {
+          const backupPath = backupFile(CLAUDE_SETTINGS_FILE);
+          const result = stripManagedEnv(settingsJsonState.data, ['ANTHROPIC_AUTH_TOKEN']);
+          writeJsonAtomic(CLAUDE_SETTINGS_FILE, result.settings, 0o600);
+          console.log('Fixed ~/.claude/settings.json: removed ANTHROPIC_AUTH_TOKEN to avoid auth ambiguity');
+          console.log(`  Backup: ${backupPath}`);
+          changedFiles += 1;
         }
       }
 
-      // Fix 2: Also check settings.local.json for double auth conflict
-      if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
-        try {
-          const settingsLocal = loadClaudeSettings();
-          if (settingsLocal.env &&
-              settingsLocal.env.ANTHROPIC_AUTH_TOKEN &&
-              settingsLocal.env.ANTHROPIC_API_KEY) {
-            // If we have both, remove ANTHROPIC_API_KEY since profiles use ANTHROPIC_AUTH_TOKEN
-            delete settingsLocal.env.ANTHROPIC_API_KEY;
-            const timestamp = Date.now();
-            const backupFile = `${CLAUDE_SETTINGS_FILE}.bak.${timestamp}`;
-            fs.copyFileSync(CLAUDE_SETTINGS_FILE, backupFile);
-            saveClaudeSettings(settingsLocal);
-            console.log(`✓ Fixed settings.local.json: removed conflicting ANTHROPIC_API_KEY`);
-            console.log(`  Backup: ${backupFile}`);
-            fixedCount++;
-          }
-        } catch (e) {
-          console.log(`✗ Failed to fix settings.local.json: ${e.message}`);
-        }
+      const legacyLocalState = collectSettingsFileConflicts(LEGACY_SETTINGS_LOCAL_FILE);
+      if (legacyLocalState.exists && !legacyLocalState.parseError && legacyLocalState.keys.length > 0) {
+        const backupPath = backupFile(LEGACY_SETTINGS_LOCAL_FILE);
+        const result = stripManagedEnv(legacyLocalState.data, legacyLocalState.keys);
+        writeJsonAtomic(LEGACY_SETTINGS_LOCAL_FILE, result.settings, 0o600);
+        console.log(`Fixed legacy ~/.claude/settings.local.json: removed ${result.removed} key(s)`);
+        console.log(`  Backup: ${backupPath}`);
+        changedFiles += 1;
       }
 
-      // Fix 2: Remove ANTHROPIC lines from shell rc files
-      const rcFiles = [
-        path.join(os.homedir(), '.bashrc'),
-        path.join(os.homedir(), '.bash_profile'),
-        path.join(os.homedir(), '.zshrc'),
-        path.join(os.homedir(), '.zprofile'),
-        path.join(os.homedir(), '.profile')
-      ];
-
-      rcFiles.forEach(rcPath => {
-        if (fs.existsSync(rcPath) && fs.accessSync(rcPath, fs.constants.W_OK)) {
-          try {
-            const content = fs.readFileSync(rcPath, 'utf8');
-            const lines = content.split('\n');
-            const originalCount = lines.length;
-            // Keep lines that don't have uncommented ANTHROPIC_
-            const newLines = lines.filter(line => {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('#')) return true;
-              return !trimmed.includes('ANTHROPIC_');
-            });
-            if (newLines.length < originalCount) {
-              const removed = originalCount - newLines.length;
-              // Create backup
-              const timestamp = Date.now();
-              const backupFile = `${rcPath}.bak.${timestamp}`;
-              fs.copyFileSync(rcPath, backupFile);
-              fs.writeFileSync(rcPath, newLines.join('\n'), { mode: 0o644 });
-              console.log(`✓ Fixed ${rcPath}: removed ${removed} ANTHROPIC_ line(s)`);
-              console.log(`  Backup: ${backupFile}`);
-              fixedCount++;
-            }
-          } catch (e) {
-            console.log(`✗ Failed to fix ${rcPath}: ${e.message}`);
-          }
+      collectRcFileConflicts(SHELL_RC_FILES).forEach(info => {
+        if (!info.exists || info.parseError || info.lineCount === 0 || !info.writable) {
+          return;
         }
+        const backupPath = backupFile(info.filePath);
+        const result = cleanRcFile(info.filePath);
+        fs.writeFileSync(info.filePath, result.content, { mode: 0o644 });
+        console.log(`Fixed ${info.filePath}: removed ${result.removed} managed line(s)`);
+        console.log(`  Backup: ${backupPath}`);
+        changedFiles += 1;
       });
 
-      // Also unset conflicting environment variables in current process
-      const allKeys = [
-        'ANTHROPIC_BASE_URL',
-        'ANTHROPIC_AUTH_TOKEN',
-        'ANTHROPIC_API_KEY',
-        'ANTHROPIC_MODEL',
-        'API_TIMEOUT_MS'
-      ];
-      let unsetCount = 0;
-      allKeys.forEach(key => {
+      PROFILE_ENV_KEYS.forEach(key => {
         if (process.env[key] !== undefined) {
           delete process.env[key];
-          unsetCount++;
+          unsetCount += 1;
         }
       });
       if (unsetCount > 0) {
-        console.log(`✓ Unset ${unsetCount} ANTHROPIC_* environment variable(s) in current session`);
-        console.log('   Note: This only affects the current shell session');
+        console.log(`Unset ${unsetCount} environment variable(s) in the current process`);
       }
 
-      console.log();
-      console.log('=== Fix Complete ===');
-      if (fixedCount > 0 || unsetCount > 0) {
-        console.log(`✓ Fixed ${fixedCount} file(s), unset ${unsetCount} variable(s)`);
-        console.log();
-        console.log('Next steps:');
-        console.log('  1. For permanent fix: disconnect SSH and reconnect');
-        console.log('  2. Then run: claude-proxy use <your-profile-name>');
-        console.log('  3. Then start Claude Code: claude');
+      console.log('\n=== Fix Complete ===');
+      if (changedFiles === 0 && unsetCount === 0) {
+        console.log('No conflicts needed fixing.');
       } else {
-        console.log('✓ No conflicts needed fixing');
+        console.log(`Updated ${changedFiles} file(s) and unset ${unsetCount} variable(s).`);
+        printRestartSteps();
       }
     });
 
   program
     .command('clean')
-    .description('Completely clean ALL ANTHROPIC configuration from all locations (start fresh)')
+    .description('Completely clean all managed Claude proxy configuration and start fresh')
     .action(() => {
       console.log('=== Claude Proxy Complete Clean ===\n');
-      console.log('WARNING: This will remove ALL ANTHROPIC configuration from:');
-      console.log('  - settings.json');
-      console.log('  - settings.local.json');
+      console.log('This removes managed Claude proxy configuration from:');
+      console.log('  - ~/.claude/settings.json');
+      console.log('  - ~/.claude/settings.local.json');
       console.log('  - shell rc files (.bashrc, .zshrc, etc.)');
       console.log('  - current session environment variables');
-      console.log('Your saved profiles will be kept.\n');
+      console.log('Saved profiles in ~/.claude-profiles/profiles.json are kept.\n');
 
-      let cleanedCount = 0;
+      let changedFiles = 0;
+      let unsetCount = 0;
 
-      // Clean 1: Clean settings.json - remove all ANTHROPIC
-      const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
-      if (fs.existsSync(SETTINGS_JSON)) {
-        try {
-          const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
-          let removed = 0;
-          if (settingsJson.env) {
-            Object.keys(settingsJson.env).forEach(key => {
-              if (key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY') {
-                delete settingsJson.env[key];
-                removed++;
-              }
-            });
-            if (Object.keys(settingsJson.env).length === 0) {
-              delete settingsJson.env;
-            }
-          }
-          if (removed > 0) {
-            const timestamp = Date.now();
-            const backupFile = `${SETTINGS_JSON}.bak.${timestamp}`;
-            fs.copyFileSync(SETTINGS_JSON, backupFile);
-            fs.writeFileSync(SETTINGS_JSON, JSON.stringify(settingsJson, null, 2), { mode: 0o600 });
-            console.log(`✓ Cleaned settings.json: removed ${removed} ANTHROPIC_* field(s)`);
-            console.log(`  Backup: ${backupFile}`);
-            cleanedCount++;
-          } else {
-            console.log('✓ settings.json already clean');
-          }
-        } catch (e) {
-          console.log(`✗ Failed to clean settings.json: ${e.message}`);
-        }
+      const settingsJsonState = collectSettingsFileConflicts(CLAUDE_SETTINGS_FILE);
+      if (settingsJsonState.exists && !settingsJsonState.parseError && settingsJsonState.keys.length > 0) {
+        const backupPath = backupFile(CLAUDE_SETTINGS_FILE);
+        const result = stripManagedEnv(settingsJsonState.data, settingsJsonState.keys);
+        writeJsonAtomic(CLAUDE_SETTINGS_FILE, result.settings, 0o600);
+        console.log(`Cleaned ~/.claude/settings.json: removed ${result.removed} key(s)`);
+        console.log(`  Backup: ${backupPath}`);
+        changedFiles += 1;
       }
 
-      // Clean 2: Clean settings.local.json - empty env completely
-      if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
-        try {
-          const timestamp = Date.now();
-          const backupFile = `${CLAUDE_SETTINGS_FILE}.bak.${timestamp}`;
-          fs.copyFileSync(CLAUDE_SETTINGS_FILE, backupFile);
-          // Write empty env
-          fs.writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify({ env: {} }, null, 2), { mode: 0o600 });
-          console.log(`✓ Cleaned settings.local.json: cleared all environment variables`);
-          console.log(`  Backup: ${backupFile}`);
-          cleanedCount++;
-        } catch (e) {
-          console.log(`✗ Failed to clean settings.local.json: ${e.message}`);
-        }
+      const legacyLocalState = collectSettingsFileConflicts(LEGACY_SETTINGS_LOCAL_FILE);
+      if (legacyLocalState.exists && !legacyLocalState.parseError && legacyLocalState.keys.length > 0) {
+        const backupPath = backupFile(LEGACY_SETTINGS_LOCAL_FILE);
+        const result = stripManagedEnv(legacyLocalState.data, legacyLocalState.keys);
+        writeJsonAtomic(LEGACY_SETTINGS_LOCAL_FILE, result.settings, 0o600);
+        console.log(`Cleaned legacy ~/.claude/settings.local.json: removed ${result.removed} key(s)`);
+        console.log(`  Backup: ${backupPath}`);
+        changedFiles += 1;
       }
 
-      // Clean 3: Remove all ANTHROPIC lines from rc files
-      const rcFiles = [
-        path.join(os.homedir(), '.bashrc'),
-        path.join(os.homedir(), '.bash_profile'),
-        path.join(os.homedir(), '.zshrc'),
-        path.join(os.homedir(), '.zprofile'),
-        path.join(os.homedir(), '.profile')
-      ];
-
-      rcFiles.forEach(rcPath => {
-        if (fs.existsSync(rcPath) && fs.accessSync(rcPath, fs.constants.W_OK)) {
-          try {
-            const content = fs.readFileSync(rcPath, 'utf8');
-            const lines = content.split('\n');
-            const originalCount = lines.length;
-            const newLines = lines.filter(line => {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('#')) return true;
-              return !trimmed.includes('ANTHROPIC_');
-            });
-            if (newLines.length < originalCount) {
-              const removed = originalCount - newLines.length;
-              const timestamp = Date.now();
-              const backupFile = `${rcPath}.bak.${timestamp}`;
-              fs.copyFileSync(rcPath, backupFile);
-              fs.writeFileSync(rcPath, newLines.join('\n'), { mode: 0o644 });
-              console.log(`✓ Cleaned ${rcPath}: removed ${removed} ANTHROPIC_ line(s)`);
-              console.log(`  Backup: ${backupFile}`);
-              cleanedCount++;
-            }
-          } catch (e) {
-            console.log(`✗ Failed to clean ${rcPath}: ${e.message}`);
-          }
+      collectRcFileConflicts(SHELL_RC_FILES).forEach(info => {
+        if (!info.exists || info.parseError || info.lineCount === 0 || !info.writable) {
+          return;
         }
+        const backupPath = backupFile(info.filePath);
+        const result = cleanRcFile(info.filePath);
+        fs.writeFileSync(info.filePath, result.content, { mode: 0o644 });
+        console.log(`Cleaned ${info.filePath}: removed ${result.removed} managed line(s)`);
+        console.log(`  Backup: ${backupPath}`);
+        changedFiles += 1;
       });
 
-      // Clean 4: Unset all ANTHROPIC from current process
-      const allKeys = [
-        'ANTHROPIC_BASE_URL',
-        'ANTHROPIC_AUTH_TOKEN',
-        'ANTHROPIC_API_KEY',
-        'ANTHROPIC_MODEL',
-        'API_TIMEOUT_MS'
-      ];
-      let unsetCount = 0;
-      allKeys.forEach(key => {
+      PROFILE_ENV_KEYS.forEach(key => {
         if (process.env[key] !== undefined) {
           delete process.env[key];
-          unsetCount++;
+          unsetCount += 1;
         }
       });
       if (unsetCount > 0) {
-        console.log(`✓ Unset ${unsetCount} ANTHROPIC_* environment variable(s) in current session');
+        console.log(`Unset ${unsetCount} environment variable(s) in the current process`);
       }
 
-      console.log();
-      console.log('=== Clean Complete ===');
-      console.log('✓ All ANTHROPIC configuration has been cleaned from all locations.');
-      console.log();
-      console.log('Next steps (to set up your profile again):');
-      console.log('  1. Disconnect SSH completely and reconnect');
-      console.log('  2. Verify clean: claude-proxy doctor');
-      console.log('  3. Switch to your profile: claude-proxy use <profile-name>');
-      console.log('  4. Start Claude Code: claude');
+      console.log('\n=== Clean Complete ===');
+      console.log('Managed Claude proxy configuration has been removed from writable locations.');
+      if (changedFiles === 0 && unsetCount === 0) {
+        console.log('Nothing needed cleaning.');
+      }
+      printRestartSteps();
     });
 
   program.parse();
