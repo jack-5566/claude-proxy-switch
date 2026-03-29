@@ -272,7 +272,7 @@ function main() {
         return;
       }
 
-      console.log('Current Claude Code configuration:');
+      console.log('Current Claude Code configuration (settings.local.json):');
       console.log('');
       Object.entries(settings.env).forEach(([key, value]) => {
         // Mask token for security
@@ -282,6 +282,126 @@ function main() {
         }
         console.log(`  ${key}: ${displayValue}`);
       });
+    });
+
+  program
+    .command('doctor')
+    .description('Diagnose configuration conflicts')
+    .action(() => {
+      console.log('=== Claude Proxy Configuration Doctor ===\n');
+
+      // Check 1: Environment variables
+      console.log('1. Checking environment variables:');
+      const conflictingEnv = [
+        'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_AUTH_TOKEN',
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_MODEL',
+        'API_TIMEOUT_MS'
+      ].filter(key => process.env[key] !== undefined);
+
+      if (conflictingEnv.length > 0) {
+        console.log('   ⚠️  Found ANTHROPIC_* environment variables:');
+        conflictingEnv.forEach(key => {
+          const val = process.env[key];
+          const display = key.includes('TOKEN') || key.includes('KEY') && val.length > 8
+            ? val.substring(0, 4) + '...' + val.substring(val.length - 4)
+            : val;
+          console.log(`      ${key}=${display}`);
+        });
+        console.log('   ⚠️  Environment variables OVERRIDE ALL configuration files!');
+        console.log('   Fix: unset these variables and remove them from your shell rc file\n');
+      } else {
+        console.log('   ✓ No conflicting environment variables found\n');
+      }
+
+      // Check 2: settings.json
+      console.log('2. Checking ~/.claude/settings.json:');
+      const SETTINGS_JSON = path.join(os.homedir(), '.claude', 'settings.json');
+      let hasSettingsJsonConflict = false;
+      if (fs.existsSync(SETTINGS_JSON)) {
+        try {
+          const settingsJson = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'));
+          if (settingsJson.env) {
+            const anthropicKeys = Object.keys(settingsJson.env).filter(key =>
+              key.startsWith('ANTHROPIC_') || key === 'ANTHROPIC_API_KEY'
+            );
+            if (anthropicKeys.length > 0) {
+              hasSettingsJsonConflict = true;
+              console.log('   ⚠️  Found ANTHROPIC_* configuration in settings.json:');
+              anthropicKeys.forEach(key => {
+                const val = settingsJson.env[key];
+                const display = (key.includes('TOKEN') || key.includes('KEY')) && val.length > 8
+                  ? val.substring(0, 4) + '...' + val.substring(val.length - 4)
+                  : val;
+                console.log(`      ${key}=${display}`);
+              });
+              console.log('   ⚠️  Claude Code may use this over settings.local.json');
+              console.log('   Fix: echo "{}" > ~/.claude/settings.json\n');
+            }
+          }
+          if (!hasSettingsJsonConflict) {
+            console.log('   ✓ No conflicting ANTHROPIC_* configuration found\n');
+          }
+        } catch (e) {
+          console.log('   ⚠️  Failed to parse settings.json: ' + e.message + '\n');
+        }
+      } else {
+        console.log('   ✓ settings.json does not exist\n');
+      }
+
+      // Check 3: settings.local.json
+      console.log('3. Checking ~/.claude/settings.local.json:');
+      if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
+        try {
+          const settingsLocal = loadClaudeSettings();
+          if (settingsLocal.env && Object.keys(settingsLocal.env).length > 0) {
+            console.log('   ✓ Configuration found:');
+            Object.entries(settingsLocal.env).forEach(([key, value]) => {
+              const display = (key.includes('TOKEN') || key.includes('KEY')) && value.length > 8
+                ? value.substring(0, 4) + '...' + value.substring(value.length - 4)
+                : value;
+              console.log(`      ${key}=${display}`);
+            });
+          } else {
+            console.log('   ⚠️  settings.local.json exists but has no env configuration\n');
+          }
+        } catch (e) {
+          console.log('   ⚠️  Failed to parse settings.local.json: ' + e.message + '\n');
+        }
+      } else {
+        console.log('   ⚠️  settings.local.json does not exist\n');
+      }
+
+      // Check 4: Saved profiles
+      console.log('4. Checking saved profiles:');
+      const config = loadProfiles();
+      const names = Object.keys(config.profiles);
+      if (names.length > 0) {
+        console.log(`   ✓ ${names.length} saved profile(s):`);
+        names.forEach(name => {
+          const p = config.profiles[name];
+          console.log(`      ${name.padEnd(12)} → ${p.ANTHROPIC_BASE_URL}`);
+        });
+        if (config.current) {
+          console.log(`   Current selected: ${config.current}`);
+        }
+      } else {
+        console.log('   ⚠️  No saved profiles\n');
+      }
+      console.log();
+
+      // Summary
+      console.log('=== Summary ===');
+      if (conflictingEnv.length === 0 && !hasSettingsJsonConflict) {
+        console.log('✓ No conflicts detected. If switch still not working:');
+        console.log('  1. Make sure you fully restart Claude Code');
+        console.log('  2. Check that your profile has the correct ANTHROPIC_BASE_URL');
+      } else {
+        console.log('⚠️  Conflicts detected above. Please fix them before switching.');
+        console.log('   After fixing, run: claude-proxy use <profile-name>');
+        console.log('   Then fully restart Claude Code.');
+      }
     });
 
   program.parse();
