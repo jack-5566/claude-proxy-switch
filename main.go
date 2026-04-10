@@ -12,11 +12,13 @@ import (
 	"time"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
 
 var (
 	homeDir            string
 	claudeDir          string
+	codexDir           string
+	codexConfigFile    string
 	configDir          string
 	configFile         string
 	claudeSettingsFile string
@@ -47,6 +49,8 @@ func init() {
 		os.Exit(1)
 	}
 	claudeDir = filepath.Join(homeDir, ".claude")
+	codexDir = filepath.Join(homeDir, ".codex")
+	codexConfigFile = filepath.Join(codexDir, "config.toml")
 	configDir = filepath.Join(homeDir, ".claude-profiles")
 	configFile = filepath.Join(configDir, "profiles.json")
 	claudeSettingsFile = filepath.Join(claudeDir, "settings.json")
@@ -65,6 +69,171 @@ func init() {
 type ProfilesData struct {
 	Current  string                       `json:"current"`
 	Profiles map[string]map[string]string `json:"profiles"`
+}
+
+// ---- Codex config.toml helpers ----
+
+// loadCodexToml reads ~/.codex/config.toml as raw lines, returns (lines, map of top-level scalar keys)
+func loadCodexToml() ([]string, map[string]string) {
+	data, err := os.ReadFile(codexConfigFile)
+	if err != nil {
+		return nil, map[string]string{}
+	}
+	lines := strings.Split(string(data), "\n")
+	kv := map[string]string{}
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "[") {
+			continue
+		}
+		idx := strings.IndexByte(t, '=')
+		if idx < 0 {
+			continue
+		}
+		k := strings.TrimSpace(t[:idx])
+		v := strings.Trim(strings.TrimSpace(t[idx+1:]), `"`)
+		kv[k] = v
+	}
+	return lines, kv
+}
+
+// saveCodexToml rewrites the managed top-level scalar keys (base_url, model) in config.toml,
+// preserving all other content (section tables, comments, etc.).
+func saveCodexToml(updates map[string]string) error {
+	os.MkdirAll(codexDir, 0o700) //nolint
+	lines, _ := loadCodexToml()
+
+	codexManagedKeys := []string{"openai_base_url", "api_key", "model"}
+	isManagedCodexKey := func(k string) bool {
+		for _, mk := range codexManagedKeys {
+			if mk == k {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Track which managed keys we've already replaced
+	replaced := map[string]bool{}
+	newLines := make([]string, 0, len(lines)+len(updates))
+	inSection := false
+
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "[") {
+			inSection = true
+			newLines = append(newLines, line)
+			continue
+		}
+		if inSection {
+			newLines = append(newLines, line)
+			continue
+		}
+		idx := strings.IndexByte(t, '=')
+		if idx >= 0 {
+			k := strings.TrimSpace(t[:idx])
+			if isManagedCodexKey(k) {
+				if newVal, ok := updates[k]; ok {
+					newLines = append(newLines, fmt.Sprintf(`%s = "%s"`, k, newVal))
+					replaced[k] = true
+				} else {
+					// key should be removed (not in updates)
+					continue
+				}
+				continue
+			}
+		}
+		newLines = append(newLines, line)
+	}
+
+	// Append any keys not yet written (new keys) — insert before the first section
+	var newKeys []string
+	for _, k := range codexManagedKeys {
+		if !replaced[k] {
+			if v, ok := updates[k]; ok {
+				newKeys = append(newKeys, fmt.Sprintf(`%s = "%s"`, k, v))
+			}
+		}
+	}
+	if len(newKeys) > 0 {
+		// Find insertion point: before the first [section] line
+		insertAt := len(newLines)
+		for i, l := range newLines {
+			if strings.HasPrefix(strings.TrimSpace(l), "[") {
+				insertAt = i
+				break
+			}
+		}
+		tail := append([]string{}, newLines[insertAt:]...)
+		newLines = append(newLines[:insertAt], newKeys...)
+		newLines = append(newLines, tail...)
+	}
+
+	content := strings.Join(newLines, "\n")
+	// Ensure single trailing newline
+	content = strings.TrimRight(content, "\n") + "\n"
+
+	tmp := fmt.Sprintf("%s.tmp.%d", codexConfigFile, os.Getpid())
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, codexConfigFile)
+}
+
+// applyCodexProfile writes base_url, api_key (and model if present) from a profile to ~/.codex/config.toml.
+func applyCodexProfile(profile map[string]string) {
+	updates := map[string]string{}
+	if v := profile["ANTHROPIC_BASE_URL"]; v != "" {
+		updates["openai_base_url"] = strings.TrimRight(v, "/") + "/v1"
+	}
+	if v := profile["ANTHROPIC_MODEL"]; v != "" {
+		updates["model"] = v
+	}
+	// sync API key: prefer ANTHROPIC_API_KEY, fallback to ANTHROPIC_AUTH_TOKEN
+	if v := firstSet(profile["ANTHROPIC_API_KEY"], profile["ANTHROPIC_AUTH_TOKEN"]); v != "" {
+		updates["api_key"] = v
+	}
+	if len(updates) == 0 {
+		return
+	}
+	if err := saveCodexToml(updates); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not update Codex config: %v\n", err)
+		return
+	}
+	fmt.Printf("  Updated Codex config: %s\n", codexConfigFile)
+	for _, k := range []string{"openai_base_url", "api_key", "model"} {
+		if v, ok := updates[k]; ok {
+			fmt.Printf("    %s = %s\n", k, maskValue(k, v))
+		}
+	}
+}
+
+// applyCodexAuth writes ~/.codex/auth.json with apikey auth mode, clearing any stale chatgpt tokens.
+func applyCodexAuth(profile map[string]string) {
+	apiKey := firstSet(profile["ANTHROPIC_API_KEY"], profile["ANTHROPIC_AUTH_TOKEN"])
+	if apiKey == "" {
+		return
+	}
+	os.MkdirAll(codexDir, 0o700) //nolint
+	auth := map[string]string{
+		"OPENAI_API_KEY": apiKey,
+		"auth_mode":      "apikey",
+	}
+	data, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not marshal Codex auth: %v\n", err)
+		return
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", filepath.Join(codexDir, "auth.json"), os.Getpid())
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not write Codex auth: %v\n", err)
+		return
+	}
+	if err := os.Rename(tmp, filepath.Join(codexDir, "auth.json")); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not save Codex auth: %v\n", err)
+		return
+	}
+	fmt.Printf("  Updated Codex auth: %s\n", filepath.Join(codexDir, "auth.json"))
 }
 
 // ---- File helpers ----
@@ -147,6 +316,36 @@ func firstSet(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func splitFlagAndPosArgs(args []string, valueFlags map[string]bool, boolFlags map[string]bool) []string {
+	result := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") || arg == "-" || arg == "--" {
+			result = append(result, arg)
+			continue
+		}
+		if strings.Contains(arg, "=") {
+			result = append(result, arg)
+			continue
+		}
+		if valueFlags[arg] {
+			if i+1 < len(args) {
+				result = append(result, arg+"="+args[i+1])
+				i++
+				continue
+			}
+			result = append(result, arg)
+			continue
+		}
+		if boolFlags[arg] {
+			result = append(result, arg)
+			continue
+		}
+		result = append(result, arg)
+	}
+	return result
 }
 
 // ---- Profile management ----
@@ -422,13 +621,27 @@ func cmdAdd(args []string) {
 	fs.StringVar(&pl, "proxy", "", "HTTP/HTTPS proxy URL")
 	fs.StringVar(&k, "k", "", "timeout (shorthand)")
 	fs.StringVar(&kl, "timeout", "", "API timeout in milliseconds")
-	fs.Parse(args) //nolint
 
-	if fs.NArg() < 2 {
+	normalizedArgs := splitFlagAndPosArgs(args, map[string]bool{
+		"-t":       true,
+		"--token":  true,
+		"-a":       true,
+		"--api-key": true,
+		"-m":       true,
+		"--model":  true,
+		"-p":       true,
+		"--proxy":  true,
+		"-k":       true,
+		"--timeout": true,
+	}, map[string]bool{})
+	fs.Parse(normalizedArgs) //nolint
+	posArgs := fs.Args()
+
+	if len(posArgs) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: claude-proxy add <name> <baseUrl> [options]")
 		os.Exit(1)
 	}
-	name, baseURL := fs.Arg(0), fs.Arg(1)
+	name, baseURL := posArgs[0], posArgs[1]
 
 	profile := map[string]string{"ANTHROPIC_BASE_URL": baseURL}
 	if v := firstSet(tl, t); v != "" {
@@ -510,11 +723,21 @@ func cmdList(args []string) {
 }
 
 func cmdUse(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: claude-proxy use <name>")
+	fs := flag.NewFlagSet("use", flag.ExitOnError)
+	var codexOnly bool
+	fs.BoolVar(&codexOnly, "codex", false, "apply profile to Codex only (do not update Claude settings)")
+
+	normalizedArgs := splitFlagAndPosArgs(args, map[string]bool{}, map[string]bool{
+		"--codex": true,
+	})
+	fs.Parse(normalizedArgs) //nolint
+	posArgs := fs.Args()
+
+	if len(posArgs) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-proxy use <name> [--codex]")
 		os.Exit(1)
 	}
-	name := args[0]
+	name := posArgs[0]
 	d := loadProfiles()
 	rawProfile, ok := d.Profiles[name]
 	if !ok {
@@ -532,25 +755,38 @@ func cmdUse(args []string) {
 		os.Exit(1)
 	}
 	profile := syncModelEnv(rawProfile)
-	settings, env := loadClaudeSettings()
-	for _, key := range profileEnvKeys {
-		delete(env, key)
-	}
-	for k, v := range profile {
-		env[k] = v
+	if !codexOnly {
+		settings, env := loadClaudeSettings()
+		for _, key := range profileEnvKeys {
+			delete(env, key)
+		}
+		for k, v := range profile {
+			env[k] = v
+		}
+		saveClaudeSettings(settings, env)
 	}
 	d.Profiles[name] = profile
 	d.Current = name
 	saveProfiles(d)
-	saveClaudeSettings(settings, env)
+	applyCodexProfile(profile)
+	applyCodexAuth(profile)
 
-	fmt.Printf("Switched to profile '%s'\n", name)
-	fmt.Printf("  Updated: %s\n", claudeSettingsFile)
+	if codexOnly {
+		fmt.Printf("Applied profile '%s' to Codex only\n", name)
+		fmt.Printf("  Claude settings unchanged: %s\n", claudeSettingsFile)
+	} else {
+		fmt.Printf("Switched to profile '%s'\n", name)
+		fmt.Printf("  Updated: %s\n", claudeSettingsFile)
+	}
 	fmt.Println()
-	fmt.Println("Configuration:")
+	fmt.Println("Profile configuration:")
 	printEnvEntries(profile)
 	fmt.Println()
-	fmt.Println("Restart Claude Code for changes to take effect.")
+	if codexOnly {
+		fmt.Println("Restart Codex CLI for changes to take effect.")
+	} else {
+		fmt.Println("Restart Claude Code for changes to take effect.")
+	}
 }
 
 func cmdCurrent(args []string) {
@@ -575,11 +811,22 @@ func cmdShow(args []string) {
 	_, env := loadClaudeSettings()
 	if len(env) == 0 {
 		fmt.Println("No environment configuration found.")
-		return
+	} else {
+		fmt.Println("Current Claude Code configuration (~/.claude/settings.json):")
+		fmt.Println()
+		printEnvEntries(env)
 	}
-	fmt.Println("Current Claude Code configuration (~/.claude/settings.json):")
-	fmt.Println()
-	printEnvEntries(env)
+
+	_, codexKV := loadCodexToml()
+	if len(codexKV) > 0 {
+		fmt.Println()
+		fmt.Println("Current Codex configuration (~/.codex/config.toml):")
+		for _, k := range []string{"openai_base_url", "api_key", "model"} {
+			if v, ok := codexKV[k]; ok {
+				fmt.Printf("  %s = %s\n", k, v)
+			}
+		}
+	}
 }
 
 func cmdDoctor(args []string) {
@@ -628,9 +875,24 @@ func cmdDoctor(args []string) {
 		fmt.Printf("   Legacy managed keys: %s\n", strings.Join(li.managedKeys, ", "))
 	}
 
-	// 4. Profiles
+	// 4. Codex config
+	_, codexKV := loadCodexToml()
+	fmt.Println("\n4. Checking ~/.codex/config.toml:")
+	if _, err := os.Stat(codexConfigFile); os.IsNotExist(err) {
+		fmt.Println("   File does not exist")
+	} else if len(codexKV) == 0 {
+		fmt.Println("   No managed keys found")
+	} else {
+		for _, k := range []string{"openai_base_url", "api_key", "model"} {
+			if v, ok := codexKV[k]; ok {
+				fmt.Printf("   %s = %s\n", k, v)
+			}
+		}
+	}
+
+	// 5. Profiles
 	d := loadProfiles()
-	fmt.Println("\n4. Checking saved profiles:")
+	fmt.Println("\n5. Checking saved profiles:")
 	if len(d.Profiles) == 0 {
 		fmt.Println("   No saved profiles")
 	} else {
@@ -648,10 +910,10 @@ func cmdDoctor(args []string) {
 		}
 	}
 
-	// 5. RC files
+	// 6. RC files
 	allRc := append(append([]string{}, shellRcFiles...), systemRcFiles...)
 	rcInfos := scanRcFiles(allRc)
-	fmt.Println("\n5. Checking shell rc files for stale configuration:")
+	fmt.Println("\n6. Checking shell rc files for stale configuration:")
 	hasConflicts := false
 	for _, info := range rcInfos {
 		if info.lineCount > 0 || info.err != nil {
@@ -838,6 +1100,19 @@ func cmdClean(args []string) {
 	printRestartSteps()
 }
 
+func cmdCodexReset(args []string) {
+	if _, err := os.Stat(codexConfigFile); os.IsNotExist(err) {
+		fmt.Println("~/.codex/config.toml not found, nothing to do.")
+		return
+	}
+	if err := saveCodexToml(map[string]string{}); err != nil {
+		fmt.Fprintf(os.Stderr, "Error resetting Codex config: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Codex config reset: removed base_url and model from ~/.codex/config.toml")
+	fmt.Println("Codex will now use its default API endpoint.")
+}
+
 func printUsage() {
 	fmt.Printf(`claude-proxy v%s - Quickly switch between Claude Code proxy/relay configurations
 
@@ -848,12 +1123,13 @@ Commands:
   add <name> <baseUrl>    Add a new proxy profile
   remove <name>           Remove a proxy profile
   list                    List all proxy profiles
-  use <name>              Switch to a proxy profile (alias: switch)
+  use <name> [--codex]    Switch to a proxy profile (alias: switch)
   current                 Show current active profile
   show                    Show current Claude Code configuration
   doctor                  Diagnose configuration conflicts
   fix                     Automatically fix detected conflicts
   clean                   Remove all managed proxy configuration
+  codex-reset             Reset Codex to default API (remove base_url/model from ~/.codex/config.toml)
 
 Options for 'add':
   -t, --token <token>     Anthropic auth token (Authorization bearer token)
@@ -861,6 +1137,9 @@ Options for 'add':
   -m, --model <model>     Model name
   -p, --proxy <url>       HTTP/HTTPS proxy URL
   -k, --timeout <ms>      API timeout in milliseconds
+
+Options for 'use':
+  --codex                 Apply to Codex only (skip ~/.claude/settings.json)
 `, version)
 }
 
@@ -888,6 +1167,8 @@ func main() {
 		cmdFix(os.Args[2:])
 	case "clean":
 		cmdClean(os.Args[2:])
+	case "codex-reset":
+		cmdCodexReset(os.Args[2:])
 	case "--version", "-v", "version":
 		fmt.Printf("claude-proxy v%s\n", version)
 	case "--help", "-h", "help":

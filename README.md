@@ -76,9 +76,13 @@ Available profiles:
 claude-proxy use direct
 # 或者
 claude-proxy switch direct
+
+# 仅更新 Codex（不修改 Claude Code 配置）
+claude-proxy use direct --codex
 ```
 
 切换后需要**重启 Claude Code**才能生效。
+如果使用 `--codex`，则只需要重启 Codex CLI。
 
 ### 查看当前配置
 
